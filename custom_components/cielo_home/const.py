@@ -59,3 +59,13 @@ FOLLOW_ME_ON = "on"
 FOLLOW_ME_OFF = "off"
 
 DEVICE_BREEZ_MAX = "BREEZ-MAX"
+
+# Keep device state current even when Cielo temporarily rejects WebSocket
+# connections. The official integration uses the same two-minute cadence.
+REST_POLL_INTERVAL = 120
+
+# Cielo currently rate-limits the legacy WebSocket endpoint. Retrying the
+# connection every few seconds both keeps entities unavailable and can trigger
+# further server-side throttling, so back off to a bounded interval.
+WSS_INITIAL_RETRY_DELAY = 30
+WSS_MAX_RETRY_DELAY = 15 * 60

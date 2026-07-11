@@ -22,12 +22,15 @@ from homeassistant.core import HomeAssistant
 from .const import (
     IOS_USER_AGENT,
     IOS_X_API_KEY,
+    REST_POLL_INTERVAL,
     URL_API,
     URL_API_LOGIN,
     URL_API_WSS,
     URL_CIELO,
     USER_AGENT,
     WEB_X_API_KEY,
+    WSS_INITIAL_RETRY_DELAY,
+    WSS_MAX_RETRY_DELAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +39,15 @@ TIMEOUT_RECONNECT = 10
 TIME_REFRESH_TOKEN = 3300
 TIMER_PING = 540
 TIMER_PONG = 60
+
+_URL_SECRET_RE = re.compile(
+    r"([?&](?:token|access_token|refresh_token)=)[^&\s'\"]+", re.IGNORECASE
+)
+
+
+def _redact_url_secrets(value: object) -> str:
+    """Return an exception-safe representation without bearer tokens."""
+    return _URL_SECRET_RE.sub(r"\1***", str(value))
 
 # TIME_REFRESH_TOKEN = 20
 # TIMER_PING = 100
@@ -69,7 +81,10 @@ class CieloHome:
         self._last_ts_pong: int = 0
         self._last_connection_ts: int = 0
         self._last_x_api_key: str = None
-        self._reconnect_now = False
+        self._stop_event = asyncio.Event()
+        self._poll_task: asyncio.Task | None = None
+        self._wss_retry_delay = WSS_INITIAL_RETRY_DELAY
+        self._wss_rate_limited = False
         self.hass: HomeAssistant = hass
         self._entry: ConfigEntry = entry
         self._appliance_id = None
@@ -86,6 +101,11 @@ class CieloHome:
         """None."""
         self._stop_running = True
         self._is_running = False
+        self._stop_event.set()
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
         await asyncio.sleep(0.5)
 
     def add_listener(self, listener: object):
@@ -111,11 +131,11 @@ class CieloHome:
         self._last_refresh_token_ts = self.get_ts()
         self._token_expire_in_ts = self.get_ts() + TIME_REFRESH_TOKEN
 
-        await self.async_refresh_token(test=True)
+        if not await self.async_refresh_token(test=True):
+            return False
 
-        if self._access_token != "":
-            self.create_websocket_log_exception(False)
-
+        self._start_rest_polling()
+        self.create_websocket_log_exception(False)
         return True
 
     async def async_refresh_token(
@@ -174,6 +194,13 @@ class CieloHome:
                         if repjson["status"] == 200 and repjson["message"] == "SUCCESS":
                             self._access_token = repjson["data"]["accessToken"]
                             self._refresh_token = repjson["data"]["refreshToken"]
+                            # Cielo's web app accepts a key returned by the
+                            # login/refresh response. Prefer it over the
+                            # bundled fallback so a server-side key rotation
+                            # does not strand an existing config entry.
+                            response_api_key = repjson["data"].get("x-api-key")
+                            if response_api_key:
+                                self._last_x_api_key = response_api_key
                             expire: int = int(repjson["data"]["expiresIn"]) - 300
                             if (
                                 expire < self._token_expire_in_ts
@@ -190,6 +217,7 @@ class CieloHome:
                                     config_data = self._entry.data.copy()
                                     config_data["access_token"] = self._access_token
                                     config_data["refresh_token"] = self._refresh_token
+                                    config_data["x_api_key"] = self._last_x_api_key
                                     self.can_reload = False
                                     self.hass.config_entries.async_update_entry(
                                         self._entry, data=config_data
@@ -202,8 +230,8 @@ class CieloHome:
                             return True
                     else:
                         _LOGGER.error("Call refreshToken error %s", response.status)
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            _LOGGER.error("Call refreshToken failed: %s", _redact_url_secrets(err))
 
         return False
 
@@ -255,7 +283,8 @@ class CieloHome:
                             "Cielo login failed: %s", repjson.get("message")
                         )
                         return None
-                    user = repjson["data"]["user"]
+                    data = repjson["data"]
+                    user = data["user"]
                     # The mobile login does not return a sessionId; generate a
                     # client-side identifier for the websocket (the web app uses
                     # "<deviceName>-<timestamp>").
@@ -267,11 +296,32 @@ class CieloHome:
                         "refresh_token": user["refreshToken"],
                         "session_id": session_id,
                         "user_id": user["userId"],
-                        "x_api_key": WEB_X_API_KEY,
+                        "x_api_key": data.get("x-api-key") or WEB_X_API_KEY,
                     }
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            _LOGGER.error("Cielo login failed: %s", _redact_url_secrets(err))
         return None
+
+    def _start_rest_polling(self) -> None:
+        """Start the REST state poller once for this config entry."""
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = self.hass.async_create_task(self._async_poll_loop())
+
+    async def _async_poll_loop(self) -> None:
+        """Refresh state through REST while WebSocket availability is uncertain."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=REST_POLL_INTERVAL
+                )
+                break
+            except TimeoutError:
+                pass
+
+            try:
+                await self.update_state_device()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("REST state refresh failed: %s", _redact_url_secrets(err))
 
     async def async_connect_wss(self, update_state: bool = False):
         """None."""
@@ -282,7 +332,6 @@ class CieloHome:
             "User-agent": USER_AGENT,
         }
 
-        self._reconnect_now = False
         wss_uri = "wss://" + URL_API_WSS + "/websocket/"
 
         self._is_running = True
@@ -308,6 +357,8 @@ class CieloHome:
 
                     _LOGGER.info("Connected success")
                     self._last_connection_ts = self.get_ts()
+                    self._wss_retry_delay = WSS_INITIAL_RETRY_DELAY
+                    self._wss_rate_limited = False
                     self.stop_timer_connection_lost()
 
                     if update_state:
@@ -328,8 +379,6 @@ class CieloHome:
                             ):
                                 # self._timer_ping.cancel()
                                 _LOGGER.debug("Websocket closed : %s", msg.type)
-                                if (now - self._last_connection_ts) > TIMEOUT_RECONNECT:
-                                    self._reconnect_now = True
                                 break
 
                             try:
@@ -368,7 +417,6 @@ class CieloHome:
                             pass
 
                         if now > (self._token_expire_in_ts):
-                            self._reconnect_now = True
                             self._token_expire_in_ts = now + 60
                             self.create_task_log_exception(self.async_refresh_token())
                         elif now - self._last_ts_ping >= TIMER_PING:
@@ -378,7 +426,6 @@ class CieloHome:
                         elif (
                             now > (self._last_ts_pong + TIMER_PONG)
                         ) and self._last_ts_pong == self._last_ts_ping:
-                            self._reconnect_now = True
                             self._is_running = False
 
                         msg: object = None
@@ -408,8 +455,30 @@ class CieloHome:
                                     if msg is not None:
                                         self._msg_to_send.insert(0, msg)
 
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            status = getattr(err, "status", None)
+            headers = getattr(err, "headers", {}) or {}
+            retry_after = headers.get("Retry-After")
+            if status == 429:
+                self._wss_rate_limited = True
+                try:
+                    retry_delay = int(retry_after) if retry_after else 0
+                except (TypeError, ValueError):
+                    retry_delay = 0
+                self._wss_retry_delay = min(
+                    WSS_MAX_RETRY_DELAY,
+                    max(retry_delay, self._wss_retry_delay * 2),
+                )
+                _LOGGER.warning(
+                    "Cielo WebSocket is rate-limited; continuing REST polling and retrying in %s seconds",
+                    self._wss_retry_delay,
+                )
+            else:
+                self._wss_retry_delay = min(
+                    WSS_MAX_RETRY_DELAY,
+                    max(WSS_INITIAL_RETRY_DELAY, self._wss_retry_delay * 2),
+                )
+                _LOGGER.error("Cielo WebSocket failed: %s", _redact_url_secrets(err))
 
         if hasattr(self, "_ws_session") and not self._ws_session.closed:
             # self._timer_ping.cancel()
@@ -420,18 +489,19 @@ class CieloHome:
             await self._websocket.close()
 
         if not self._stop_running:
-            # for listener in self.__event_listener:
-            #    listener.lost_connection()
-            self.start_timer_connection_lost()
-            if not self._reconnect_now:
-                _LOGGER.debug(
-                    "Try reconnection in " + str(TIMEOUT_RECONNECT) + " secondes"
-                )
-                await asyncio.sleep(TIMEOUT_RECONNECT)
-            else:
-                _LOGGER.debug("Reconnection")
+            # A 429 describes Cielo's WebSocket service, not the controller's
+            # reachability. Keep entities available while the REST poller can
+            # still obtain state.
+            if not self._wss_rate_limited:
+                self.start_timer_connection_lost()
+            _LOGGER.debug(
+                "Retrying Cielo WebSocket in %s seconds", self._wss_retry_delay
+            )
+            await asyncio.sleep(self._wss_retry_delay)
             self._last_ts_ping = 0
-            await self.async_refresh_token()
+            if self.get_ts() > self._token_expire_in_ts:
+                if not await self.async_refresh_token():
+                    _LOGGER.warning("Cielo token refresh failed; retaining REST polling")
             self.create_websocket_log_exception(True)
 
     def send_action(self, msg) -> None:
@@ -674,5 +744,5 @@ class CieloHome:
 async def _log_exception(awaitable):
     try:
         return await awaitable
-    except Exception as e:
-        _LOGGER.exception(e)
+    except Exception as err:
+        _LOGGER.error("Cielo background task failed: %s", _redact_url_secrets(err))
