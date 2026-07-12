@@ -744,7 +744,23 @@ class CieloHome:
         for listener in self.__event_listener:
             for device in devices:
                 if device["macAddress"] == listener.get_mac_address():
+                    if self._is_stale_rest_state(listener.get_device(), device):
+                        _LOGGER.debug(
+                            "Ignoring stale Cielo REST state for %s",
+                            device["macAddress"],
+                        )
+                        continue
                     listener.state_device_receive(device)
+
+    @staticmethod
+    def _is_stale_rest_state(current_device: dict, polled_device: dict) -> bool:
+        """Return whether a REST response predates the current device action."""
+        try:
+            current_timestamp = int(current_device["latestAction"]["timestamp"])
+            polled_timestamp = int(polled_device["latestAction"]["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return polled_timestamp < current_timestamp
 
     async def async_get_thermostats(self):
         """Get de the list Devices/Thermostats."""
