@@ -57,22 +57,23 @@ and `refresh_token` URL parameters before logging them.
 
 ### Mobile REST command fallback
 
-The current Android Cielo Home app contains a mini-split widget command path:
+The current iOS Cielo Home app contains a mini-split widget command path:
 `POST /device/perform-widget-action/1`. Its request supports `power`, `mode`,
 and `temp` actions and returns the resulting state. The integration uses this
 path only while the WebSocket is rate-limited, and only for those three basic
 actions. Switches such as fan speed, swing, turbo, light, and follow-me remain
 WebSocket-only.
 
-The endpoint requires the mobile device ID supplied during the mobile login.
-The previous config flow generated that ID but did not retain it. The updated
-flow stores `mobile_device_id` with the config entry so it can submit the
-fallback command. Existing entries can use Home Assistant's **Reconfigure**
-action after installing this revision; the flow asks for Cielo credentials,
-registers a fresh HA mobile client, verifies the REST token, and replaces the
-entry data atomically. Commands are deliberately not queued while rate-limited:
-an old power or temperature change must never be applied after a long
-server-side recovery.
+The request must use Cielo's current iOS app identity, its registered mobile
+device ID, `actionSource: "iOS"`, and omit unavailable action fields rather
+than serializing them as JSON `null`. The config flow stores
+`mobile_device_id` with the config entry so it can submit the fallback command.
+Existing entries can use Home Assistant's **Reconfigure** action after
+installing this revision; the flow asks for Cielo credentials, registers a
+fresh HA mobile client, verifies the REST token, and replaces the entry data
+atomically. Commands are deliberately not queued while rate-limited: an old
+power or temperature change must never be applied after a long server-side
+recovery.
 
 ## Validation
 
@@ -91,8 +92,17 @@ failure. It verified that the integration:
 - does **not** invoke token refresh for that 429.
 
 The same test verifies the mobile REST fallback request shape, including the
-stored mobile device ID and the power/mode/temperature action payload. It does
-not claim a live command result yet.
+stored mobile device ID and the power/mode/temperature action payload.
+
+### Live iOS validation
+
+On 2026-07-12, a Cielo Home iOS 6.7.2 session was captured through a local
+HTTPS proxy with credentials redacted. The observed mobile identity was used to
+submit a Living Room Breez Plus (BP01) power-on request through
+`/device/perform-widget-action/1`. Cielo returned HTTP 200 with
+`status: 200` and `latestAction.power: "on"`; the physical controller reacted.
+This validates the REST command path for a Breez Plus while the legacy
+WebSocket endpoint is rate-limited.
 
 ### Personal Home Assistant device test
 

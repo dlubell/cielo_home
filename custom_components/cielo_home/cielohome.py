@@ -20,6 +20,8 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import (
+    IOS_APP_VERSION,
+    IOS_DEVICE_TYPE,
     IOS_USER_AGENT,
     IOS_X_API_KEY,
     REST_POLL_INTERVAL,
@@ -251,18 +253,18 @@ class CieloHome:
         payload = {
             "user": {
                 "isDeviceCountRequired": 1,
-                "isSmartHVAC": 1,
+                "isSmartHVAC": 0,
                 "ipAddress": "",
                 "deviceTokenId": "N/A",
                 "mobileDeviceId": mobile_device_id,
-                "deviceType": "iPhone17,1",
+                "deviceType": IOS_DEVICE_TYPE,
                 "appType": "iOS",
                 "userId": user_id,
                 "password": pwd_hash,
                 "timeZone": "-04:00",
                 "mobileDeviceName": "iPhone",
                 "locale": "en",
-                "appVersion": "4.3.0",
+                "appVersion": IOS_APP_VERSION,
             }
         }
         headers = {
@@ -567,21 +569,26 @@ class CieloHome:
             return
 
         actions = msg.get("actions", {})
+        action_payload = {
+            "power": actions.get("power"),
+            "mode": actions.get("mode"),
+            "temp": str(actions["temp"])
+            if actions.get("temp") is not None
+            else None,
+            "actionType": action_type,
+        }
+        # iOS omits unavailable widget fields rather than sending JSON null.
+        action_payload = {
+            key: value for key, value in action_payload.items() if value is not None
+        }
         payload = {
             "macAddress": device.get("macAddress"),
             "deviceName": device.get("deviceName"),
             "mobileDeviceId": self._mobile_device_id,
             "deviceId": str(device_id),
             "userId": self._user_id,
-            "actionSource": "Android",
-            "actions": {
-                "power": actions.get("power"),
-                "mode": actions.get("mode"),
-                "temp": str(actions["temp"])
-                if actions.get("temp") is not None
-                else None,
-                "actionType": action_type,
-            },
+            "actionSource": "iOS",
+            "actions": action_payload,
         }
         headers = {
             "accept": "*/*",
