@@ -67,10 +67,12 @@ WebSocket-only.
 The endpoint requires the mobile device ID supplied during the mobile login.
 The previous config flow generated that ID but did not retain it. The updated
 flow stores `mobile_device_id` with the config entry so it can submit the
-fallback command. Existing entries do not have this value and must be removed
-and added again after installing this revision. Commands are deliberately not
-queued while rate-limited: an old power or temperature change must never be
-applied after a long server-side recovery.
+fallback command. Existing entries can use Home Assistant's **Reconfigure**
+action after installing this revision; the flow asks for Cielo credentials,
+registers a fresh HA mobile client, verifies the REST token, and replaces the
+entry data atomically. Commands are deliberately not queued while rate-limited:
+an old power or temperature change must never be applied after a long
+server-side recovery.
 
 ## Validation
 
@@ -108,12 +110,18 @@ present. The meaningful live test is ongoing: during a Cielo WebSocket 429,
 the entities must remain available and refresh through REST within roughly two
 minutes rather than repeatedly toggling unavailable.
 
-For this command-fallback revision, the entry must then be removed and added
-again through Home Assistant's Cielo Home configuration flow. Test a power,
-mode, and temperature change while the WebSocket remains rate-limited. The
-mobile app is the control comparison: it must still act immediately, and Home
-Assistant must report either a successful REST command or a clear failure in
-the log rather than silently queueing the command.
+For this command-fallback revision, use the Cielo Home entry's **Reconfigure**
+action after the component is updated. Test a power, mode, and temperature
+change while the WebSocket remains rate-limited. The mobile app is the control
+comparison: it must still act immediately, and Home Assistant must report
+either a successful REST command or a clear failure in the log rather than
+silently queueing the command.
+
+On 2026-07-12, an independent new connection using an active Cielo dashboard
+WebSocket URL (including the dashboard-provided `sessionId` and access token)
+also received HTTP 429. Therefore the documented workaround must not assume
+that changing the integration's synthetic session ID will restore the legacy
+WebSocket. The server is refusing new WebSocket connections at that time.
 
 ## Rollback
 
