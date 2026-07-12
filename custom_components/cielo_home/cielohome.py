@@ -532,8 +532,9 @@ class CieloHome:
         # power or temperature request must not run much later after recovery.
         if self._wss_rate_limited:
             if device is not None and self._mobile_device_id:
-                self.create_task_log_exception(
-                    self.async_send_widget_action(msg, device), False
+                self.hass.async_create_task(
+                    self.async_send_widget_action(msg, device),
+                    "Cielo Home mobile REST command",
                 )
             else:
                 _LOGGER.warning(
