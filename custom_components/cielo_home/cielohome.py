@@ -532,10 +532,10 @@ class CieloHome:
         # power or temperature request must not run much later after recovery.
         if self._wss_rate_limited:
             if device is not None and self._mobile_device_id:
-                self.hass.async_create_task(
-                    self.async_send_widget_action(msg, device),
-                    "Cielo Home mobile REST command",
-                )
+                # Entity service methods may be invoked from an executor
+                # thread. add_job is Home Assistant's thread-safe handoff to
+                # the event loop; async_create_task is not safe here.
+                self.hass.add_job(self.async_send_widget_action(msg, device))
             else:
                 _LOGGER.warning(
                     "Cielo command dropped while WebSocket is rate-limited; "
