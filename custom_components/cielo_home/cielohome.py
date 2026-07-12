@@ -618,12 +618,37 @@ class CieloHome:
                             result.get("message", "unknown response"),
                         )
                         return
+                    self._apply_widget_action_result(device, result.get("data"))
                     _LOGGER.debug("Cielo mobile REST command accepted")
-                    await self.update_state_device()
         except Exception as err:  # noqa: BLE001
             _LOGGER.warning(
                 "Cielo mobile REST command failed: %s", _redact_url_secrets(err)
             )
+
+    def _apply_widget_action_result(
+        self, device: dict, response_data: object
+    ) -> None:
+        """Apply Cielo's command acknowledgement before the next REST poll.
+
+        The widget endpoint returns the accepted ``latestAction`` immediately,
+        while ``/web/devices`` can lag behind it. Applying the acknowledgement
+        prevents an optimistic Home Assistant state from being overwritten by
+        a stale REST response just after a successful command.
+        """
+        if not isinstance(response_data, dict):
+            return
+
+        latest_action = response_data.get("latestAction")
+        if isinstance(latest_action, dict):
+            device.setdefault("latestAction", {}).update(latest_action)
+
+        if "deviceStatus" in response_data:
+            device["deviceStatus"] = response_data["deviceStatus"]
+
+        mac_address = device.get("macAddress")
+        for listener in self.__event_listener:
+            if listener.get_mac_address() == mac_address:
+                listener.state_device_receive(device)
 
     def start_timer_connection_lost(self):
         """None."""
