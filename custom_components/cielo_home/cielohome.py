@@ -65,6 +65,7 @@ class CieloHome:
         self._refresh_token: str = ""
         self._session_id: str = ""
         self._user_id: str = ""
+        self._mobile_device_id: str = ""
         # self._user_name: str = ""
         # self._password: str = ""
         self._headers: dict[str, str] = {}
@@ -119,6 +120,7 @@ class CieloHome:
         session_id: str,
         user_id: str,
         x_api_key: str,
+        mobile_device_id: str = "",
     ) -> bool:
         """Set up Cielo Home auth."""
 
@@ -127,6 +129,7 @@ class CieloHome:
         self._session_id = session_id
         self._user_id = user_id
         self._last_x_api_key = x_api_key
+        self._mobile_device_id = mobile_device_id
 
         self._last_refresh_token_ts = self.get_ts()
         self._token_expire_in_ts = self.get_ts() + TIME_REFRESH_TOKEN
@@ -244,13 +247,14 @@ class CieloHome:
         integration's /web/* endpoints require.
         """
         pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        mobile_device_id = uuid.uuid4().hex[:8].upper()
         payload = {
             "user": {
                 "isDeviceCountRequired": 1,
                 "isSmartHVAC": 1,
                 "ipAddress": "",
                 "deviceTokenId": "N/A",
-                "mobileDeviceId": uuid.uuid4().hex[:8].upper(),
+                "mobileDeviceId": mobile_device_id,
                 "deviceType": "iPhone17,1",
                 "appType": "iOS",
                 "userId": user_id,
@@ -297,6 +301,7 @@ class CieloHome:
                         "session_id": session_id,
                         "user_id": user["userId"],
                         "x_api_key": data.get("x-api-key") or WEB_X_API_KEY,
+                        "mobile_device_id": mobile_device_id,
                     }
         except Exception as err:
             _LOGGER.error("Cielo login failed: %s", _redact_url_secrets(err))
@@ -504,8 +509,8 @@ class CieloHome:
                     _LOGGER.warning("Cielo token refresh failed; retaining REST polling")
             self.create_websocket_log_exception(True)
 
-    def send_action(self, msg) -> None:
-        """None."""
+    def send_action(self, msg, device: dict | None = None) -> None:
+        """Send an action, using Cielo's mobile REST fallback when needed."""
         # msg["token"] = self._access_token
         with contextlib.suppress(KeyError):
             if msg["mid"] == "":
@@ -519,7 +524,98 @@ class CieloHome:
 
         self._last_ts_msg = msg["ts"]
 
+        # Cielo currently rate-limits the legacy WebSocket used by this
+        # integration. The current mobile client has a REST command endpoint
+        # for its mini-split widget. It supports the basic controls exposed by
+        # Home Assistant, and unlike the socket it provides a response for the
+        # attempted command. Do not queue commands while rate-limited: an old
+        # power or temperature request must not run much later after recovery.
+        if self._wss_rate_limited:
+            if device is not None and self._mobile_device_id:
+                self.create_task_log_exception(
+                    self.async_send_widget_action(msg, device), False
+                )
+            else:
+                _LOGGER.warning(
+                    "Cielo command dropped while WebSocket is rate-limited; "
+                    "reconfigure the integration to enable the mobile REST fallback"
+                )
+            return
+
         self.send_json(msg)
+
+    async def async_send_widget_action(self, msg: dict, device: dict) -> None:
+        """Send a basic mini-split action through Cielo's mobile REST API."""
+        action_type = msg.get("actionType")
+        if msg.get("action") != "actionControl" or action_type not in {
+            "power",
+            "mode",
+            "temp",
+        }:
+            _LOGGER.warning(
+                "Cielo command %s is unavailable while WebSocket is rate-limited",
+                action_type or msg.get("action"),
+            )
+            return
+
+        device_id = device.get("deviceId")
+        if not device_id:
+            _LOGGER.warning(
+                "Cielo mobile REST fallback needs deviceId; command was not sent"
+            )
+            return
+
+        actions = msg.get("actions", {})
+        payload = {
+            "macAddress": device.get("macAddress"),
+            "deviceName": device.get("deviceName"),
+            "mobileDeviceId": self._mobile_device_id,
+            "deviceId": str(device_id),
+            "userId": self._user_id,
+            "actionSource": "Android",
+            "actions": {
+                "power": actions.get("power"),
+                "mode": actions.get("mode"),
+                "temp": str(actions["temp"])
+                if actions.get("temp") is not None
+                else None,
+                "actionType": action_type,
+            },
+        }
+        headers = {
+            "accept": "*/*",
+            "authorization": self._access_token,
+            "content-type": "application/json",
+            "x-api-key": IOS_X_API_KEY,
+            "user-agent": IOS_USER_AGENT,
+        }
+
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                    "https://" + URL_API + "/device/perform-widget-action/1",
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(
+                            "Cielo mobile REST command failed with HTTP %s",
+                            response.status,
+                        )
+                        return
+                    result = await response.json()
+                    if result.get("status") not in (None, 200):
+                        _LOGGER.warning(
+                            "Cielo mobile REST command failed: %s",
+                            result.get("message", "unknown response"),
+                        )
+                        return
+                    _LOGGER.debug("Cielo mobile REST command accepted")
+                    await self.update_state_device()
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Cielo mobile REST command failed: %s", _redact_url_secrets(err)
+            )
 
     def start_timer_connection_lost(self):
         """None."""

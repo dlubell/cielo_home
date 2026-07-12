@@ -289,7 +289,7 @@ class CieloHomeDevice:
         if overrides:
             msg = {**msg, **overrides}
 
-        self._api.send_action(msg)
+        self._api.send_action(msg, self._device)
         # self._api.send_action(msg)
 
     def send_mode_heat(self) -> None:

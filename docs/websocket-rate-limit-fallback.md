@@ -55,6 +55,23 @@ rotates the key associated with the session.
 The WebSocket and background-task error paths redact `token`, `access_token`,
 and `refresh_token` URL parameters before logging them.
 
+### Mobile REST command fallback
+
+The current Android Cielo Home app contains a mini-split widget command path:
+`POST /device/perform-widget-action/1`. Its request supports `power`, `mode`,
+and `temp` actions and returns the resulting state. The integration uses this
+path only while the WebSocket is rate-limited, and only for those three basic
+actions. Switches such as fan speed, swing, turbo, light, and follow-me remain
+WebSocket-only.
+
+The endpoint requires the mobile device ID supplied during the mobile login.
+The previous config flow generated that ID but did not retain it. The updated
+flow stores `mobile_device_id` with the config entry so it can submit the
+fallback command. Existing entries do not have this value and must be removed
+and added again after installing this revision. Commands are deliberately not
+queued while rate-limited: an old power or temperature change must never be
+applied after a long server-side recovery.
+
 ## Validation
 
 ### Isolated Home Assistant smoke test
@@ -71,6 +88,10 @@ failure. It verified that the integration:
 - schedules a later WebSocket attempt; and
 - does **not** invoke token refresh for that 429.
 
+The same test verifies the mobile REST fallback request shape, including the
+stored mobile device ID and the power/mode/temperature action payload. It does
+not claim a live command result yet.
+
 ### Personal Home Assistant device test
 
 The patch was manually deployed to a personal Home Assistant OS installation
@@ -85,8 +106,14 @@ an integration, so a backup must not remain there.
 At deployment time the integration loaded and the devices/entities were
 present. The meaningful live test is ongoing: during a Cielo WebSocket 429,
 the entities must remain available and refresh through REST within roughly two
-minutes rather than repeatedly toggling unavailable. Command delivery remains
-dependent on Cielo accepting a later WebSocket connection.
+minutes rather than repeatedly toggling unavailable.
+
+For this command-fallback revision, the entry must then be removed and added
+again through Home Assistant's Cielo Home configuration flow. Test a power,
+mode, and temperature change while the WebSocket remains rate-limited. The
+mobile app is the control comparison: it must still act immediately, and Home
+Assistant must report either a successful REST command or a clear failure in
+the log rather than silently queueing the command.
 
 ## Rollback
 
