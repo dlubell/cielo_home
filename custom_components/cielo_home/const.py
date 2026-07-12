@@ -10,13 +10,15 @@ USER_AGENT = "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit
 
 # Email/password login via the mobile endpoint (no captcha, unlike the web app).
 URL_API_LOGIN = "user/smarthvac/login/1"
-# Static app key the iOS app sends; required for the login endpoint.
-IOS_X_API_KEY = "T90bwfODtWaIUreVJtroN3itKWquNnUGRYiYUsf0"
+# Static iOS app identity required by Cielo's mobile login and widget endpoint.
+# It is separate from the web-app key used for the /web/* polling endpoints.
+IOS_X_API_KEY = "q2sEn4hxMT4Ey63auwdz64vfezvNiT4o9YSdVdjP"
 # Static web key; the integration's /web/* endpoints require this one (the iOS
 # key returns 403 there).
 WEB_X_API_KEY = "3iCWYuBqpY2g7yRq3yyTk1XCS4CMjt1n9ECCjdpd"
 IOS_USER_AGENT = (
-    "MRCOOL SmartHVAC/4.3.0 (com.smarthvac; build:2; iOS 26.5.0) Alamofire/5.9.1"
+    "Cielo Home/6.7.2 (com.cielo.smarthome.app; build:1; iOS 27.0.0) "
+    "Alamofire/5.9.1"
 )
 
 SWING_ADJUST = "Adjust"
@@ -59,3 +61,13 @@ FOLLOW_ME_ON = "on"
 FOLLOW_ME_OFF = "off"
 
 DEVICE_BREEZ_MAX = "BREEZ-MAX"
+
+# Keep device state current even when Cielo temporarily rejects WebSocket
+# connections. The official integration uses the same two-minute cadence.
+REST_POLL_INTERVAL = 120
+
+# Cielo currently rate-limits the legacy WebSocket endpoint. Retrying the
+# connection every few seconds both keeps entities unavailable and can trigger
+# further server-side throttling, so back off to a bounded interval.
+WSS_INITIAL_RETRY_DELAY = 30
+WSS_MAX_RETRY_DELAY = 15 * 60

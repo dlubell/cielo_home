@@ -22,12 +22,15 @@ from homeassistant.core import HomeAssistant
 from .const import (
     IOS_USER_AGENT,
     IOS_X_API_KEY,
+    REST_POLL_INTERVAL,
     URL_API,
     URL_API_LOGIN,
     URL_API_WSS,
     URL_CIELO,
     USER_AGENT,
     WEB_X_API_KEY,
+    WSS_INITIAL_RETRY_DELAY,
+    WSS_MAX_RETRY_DELAY,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -36,6 +39,15 @@ TIMEOUT_RECONNECT = 10
 TIME_REFRESH_TOKEN = 3300
 TIMER_PING = 540
 TIMER_PONG = 60
+
+_URL_SECRET_RE = re.compile(
+    r"([?&](?:token|access_token|refresh_token)=)[^&\s'\"]+", re.IGNORECASE
+)
+
+
+def _redact_url_secrets(value: object) -> str:
+    """Return an exception-safe representation without bearer tokens."""
+    return _URL_SECRET_RE.sub(r"\1***", str(value))
 
 # TIME_REFRESH_TOKEN = 20
 # TIMER_PING = 100
@@ -53,6 +65,7 @@ class CieloHome:
         self._refresh_token: str = ""
         self._session_id: str = ""
         self._user_id: str = ""
+        self._mobile_device_id: str = ""
         # self._user_name: str = ""
         # self._password: str = ""
         self._headers: dict[str, str] = {}
@@ -69,7 +82,10 @@ class CieloHome:
         self._last_ts_pong: int = 0
         self._last_connection_ts: int = 0
         self._last_x_api_key: str = None
-        self._reconnect_now = False
+        self._stop_event = asyncio.Event()
+        self._poll_task: asyncio.Task | None = None
+        self._wss_retry_delay = WSS_INITIAL_RETRY_DELAY
+        self._wss_rate_limited = False
         self.hass: HomeAssistant = hass
         self._entry: ConfigEntry = entry
         self._appliance_id = None
@@ -86,6 +102,11 @@ class CieloHome:
         """None."""
         self._stop_running = True
         self._is_running = False
+        self._stop_event.set()
+        if self._poll_task is not None:
+            self._poll_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._poll_task
         await asyncio.sleep(0.5)
 
     def add_listener(self, listener: object):
@@ -99,6 +120,7 @@ class CieloHome:
         session_id: str,
         user_id: str,
         x_api_key: str,
+        mobile_device_id: str = "",
     ) -> bool:
         """Set up Cielo Home auth."""
 
@@ -107,15 +129,16 @@ class CieloHome:
         self._session_id = session_id
         self._user_id = user_id
         self._last_x_api_key = x_api_key
+        self._mobile_device_id = mobile_device_id
 
         self._last_refresh_token_ts = self.get_ts()
         self._token_expire_in_ts = self.get_ts() + TIME_REFRESH_TOKEN
 
-        await self.async_refresh_token(test=True)
+        if not await self.async_refresh_token(test=True):
+            return False
 
-        if self._access_token != "":
-            self.create_websocket_log_exception(False)
-
+        self._start_rest_polling()
+        self.create_websocket_log_exception(False)
         return True
 
     async def async_refresh_token(
@@ -174,6 +197,13 @@ class CieloHome:
                         if repjson["status"] == 200 and repjson["message"] == "SUCCESS":
                             self._access_token = repjson["data"]["accessToken"]
                             self._refresh_token = repjson["data"]["refreshToken"]
+                            # Cielo's web app accepts a key returned by the
+                            # login/refresh response. Prefer it over the
+                            # bundled fallback so a server-side key rotation
+                            # does not strand an existing config entry.
+                            response_api_key = repjson["data"].get("x-api-key")
+                            if response_api_key:
+                                self._last_x_api_key = response_api_key
                             expire: int = int(repjson["data"]["expiresIn"]) - 300
                             if (
                                 expire < self._token_expire_in_ts
@@ -190,6 +220,7 @@ class CieloHome:
                                     config_data = self._entry.data.copy()
                                     config_data["access_token"] = self._access_token
                                     config_data["refresh_token"] = self._refresh_token
+                                    config_data["x_api_key"] = self._last_x_api_key
                                     self.can_reload = False
                                     self.hass.config_entries.async_update_entry(
                                         self._entry, data=config_data
@@ -202,8 +233,8 @@ class CieloHome:
                             return True
                     else:
                         _LOGGER.error("Call refreshToken error %s", response.status)
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            _LOGGER.error("Call refreshToken failed: %s", _redact_url_secrets(err))
 
         return False
 
@@ -216,13 +247,14 @@ class CieloHome:
         integration's /web/* endpoints require.
         """
         pwd_hash = hashlib.sha256(password.encode("utf-8")).hexdigest()
+        mobile_device_id = uuid.uuid4().hex[:8].upper()
         payload = {
             "user": {
                 "isDeviceCountRequired": 1,
                 "isSmartHVAC": 1,
                 "ipAddress": "",
                 "deviceTokenId": "N/A",
-                "mobileDeviceId": uuid.uuid4().hex[:8].upper(),
+                "mobileDeviceId": mobile_device_id,
                 "deviceType": "iPhone17,1",
                 "appType": "iOS",
                 "userId": user_id,
@@ -255,7 +287,8 @@ class CieloHome:
                             "Cielo login failed: %s", repjson.get("message")
                         )
                         return None
-                    user = repjson["data"]["user"]
+                    data = repjson["data"]
+                    user = data["user"]
                     # The mobile login does not return a sessionId; generate a
                     # client-side identifier for the websocket (the web app uses
                     # "<deviceName>-<timestamp>").
@@ -267,11 +300,33 @@ class CieloHome:
                         "refresh_token": user["refreshToken"],
                         "session_id": session_id,
                         "user_id": user["userId"],
-                        "x_api_key": WEB_X_API_KEY,
+                        "x_api_key": data.get("x-api-key") or WEB_X_API_KEY,
+                        "mobile_device_id": mobile_device_id,
                     }
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            _LOGGER.error("Cielo login failed: %s", _redact_url_secrets(err))
         return None
+
+    def _start_rest_polling(self) -> None:
+        """Start the REST state poller once for this config entry."""
+        if self._poll_task is None or self._poll_task.done():
+            self._poll_task = self.hass.async_create_task(self._async_poll_loop())
+
+    async def _async_poll_loop(self) -> None:
+        """Refresh state through REST while WebSocket availability is uncertain."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.wait_for(
+                    self._stop_event.wait(), timeout=REST_POLL_INTERVAL
+                )
+                break
+            except TimeoutError:
+                pass
+
+            try:
+                await self.update_state_device()
+            except Exception as err:  # noqa: BLE001
+                _LOGGER.warning("REST state refresh failed: %s", _redact_url_secrets(err))
 
     async def async_connect_wss(self, update_state: bool = False):
         """None."""
@@ -282,7 +337,6 @@ class CieloHome:
             "User-agent": USER_AGENT,
         }
 
-        self._reconnect_now = False
         wss_uri = "wss://" + URL_API_WSS + "/websocket/"
 
         self._is_running = True
@@ -308,6 +362,8 @@ class CieloHome:
 
                     _LOGGER.info("Connected success")
                     self._last_connection_ts = self.get_ts()
+                    self._wss_retry_delay = WSS_INITIAL_RETRY_DELAY
+                    self._wss_rate_limited = False
                     self.stop_timer_connection_lost()
 
                     if update_state:
@@ -328,8 +384,6 @@ class CieloHome:
                             ):
                                 # self._timer_ping.cancel()
                                 _LOGGER.debug("Websocket closed : %s", msg.type)
-                                if (now - self._last_connection_ts) > TIMEOUT_RECONNECT:
-                                    self._reconnect_now = True
                                 break
 
                             try:
@@ -368,7 +422,6 @@ class CieloHome:
                             pass
 
                         if now > (self._token_expire_in_ts):
-                            self._reconnect_now = True
                             self._token_expire_in_ts = now + 60
                             self.create_task_log_exception(self.async_refresh_token())
                         elif now - self._last_ts_ping >= TIMER_PING:
@@ -378,7 +431,6 @@ class CieloHome:
                         elif (
                             now > (self._last_ts_pong + TIMER_PONG)
                         ) and self._last_ts_pong == self._last_ts_ping:
-                            self._reconnect_now = True
                             self._is_running = False
 
                         msg: object = None
@@ -408,8 +460,30 @@ class CieloHome:
                                     if msg is not None:
                                         self._msg_to_send.insert(0, msg)
 
-        except Exception:
-            _LOGGER.error(sys.exc_info()[1])
+        except Exception as err:
+            status = getattr(err, "status", None)
+            headers = getattr(err, "headers", {}) or {}
+            retry_after = headers.get("Retry-After")
+            if status == 429:
+                self._wss_rate_limited = True
+                try:
+                    retry_delay = int(retry_after) if retry_after else 0
+                except (TypeError, ValueError):
+                    retry_delay = 0
+                self._wss_retry_delay = min(
+                    WSS_MAX_RETRY_DELAY,
+                    max(retry_delay, self._wss_retry_delay * 2),
+                )
+                _LOGGER.warning(
+                    "Cielo WebSocket is rate-limited; continuing REST polling and retrying in %s seconds",
+                    self._wss_retry_delay,
+                )
+            else:
+                self._wss_retry_delay = min(
+                    WSS_MAX_RETRY_DELAY,
+                    max(WSS_INITIAL_RETRY_DELAY, self._wss_retry_delay * 2),
+                )
+                _LOGGER.error("Cielo WebSocket failed: %s", _redact_url_secrets(err))
 
         if hasattr(self, "_ws_session") and not self._ws_session.closed:
             # self._timer_ping.cancel()
@@ -420,22 +494,23 @@ class CieloHome:
             await self._websocket.close()
 
         if not self._stop_running:
-            # for listener in self.__event_listener:
-            #    listener.lost_connection()
-            self.start_timer_connection_lost()
-            if not self._reconnect_now:
-                _LOGGER.debug(
-                    "Try reconnection in " + str(TIMEOUT_RECONNECT) + " secondes"
-                )
-                await asyncio.sleep(TIMEOUT_RECONNECT)
-            else:
-                _LOGGER.debug("Reconnection")
+            # A 429 describes Cielo's WebSocket service, not the controller's
+            # reachability. Keep entities available while the REST poller can
+            # still obtain state.
+            if not self._wss_rate_limited:
+                self.start_timer_connection_lost()
+            _LOGGER.debug(
+                "Retrying Cielo WebSocket in %s seconds", self._wss_retry_delay
+            )
+            await asyncio.sleep(self._wss_retry_delay)
             self._last_ts_ping = 0
-            await self.async_refresh_token()
+            if self.get_ts() > self._token_expire_in_ts:
+                if not await self.async_refresh_token():
+                    _LOGGER.warning("Cielo token refresh failed; retaining REST polling")
             self.create_websocket_log_exception(True)
 
-    def send_action(self, msg) -> None:
-        """None."""
+    def send_action(self, msg, device: dict | None = None) -> None:
+        """Send an action, using Cielo's mobile REST fallback when needed."""
         # msg["token"] = self._access_token
         with contextlib.suppress(KeyError):
             if msg["mid"] == "":
@@ -449,7 +524,129 @@ class CieloHome:
 
         self._last_ts_msg = msg["ts"]
 
+        # Cielo currently rate-limits the legacy WebSocket used by this
+        # integration. The current mobile client has a REST command endpoint
+        # for its mini-split widget. It supports the basic controls exposed by
+        # Home Assistant, and unlike the socket it provides a response for the
+        # attempted command. Do not queue commands while rate-limited: an old
+        # power or temperature request must not run much later after recovery.
+        if self._wss_rate_limited:
+            if device is not None and self._mobile_device_id:
+                # Entity service methods may be invoked from an executor
+                # thread. add_job is Home Assistant's thread-safe handoff to
+                # the event loop; async_create_task is not safe here.
+                self.hass.add_job(self.async_send_widget_action(msg, device))
+            else:
+                _LOGGER.warning(
+                    "Cielo command dropped while WebSocket is rate-limited; "
+                    "reconfigure the integration to enable the mobile REST fallback"
+                )
+            return
+
         self.send_json(msg)
+
+    async def async_send_widget_action(self, msg: dict, device: dict) -> None:
+        """Send a basic mini-split action through Cielo's mobile REST API."""
+        action_type = msg.get("actionType")
+        if msg.get("action") != "actionControl" or action_type not in {
+            "power",
+            "mode",
+            "temp",
+        }:
+            _LOGGER.warning(
+                "Cielo command %s is unavailable while WebSocket is rate-limited",
+                action_type or msg.get("action"),
+            )
+            return
+
+        device_id = device.get("deviceId")
+        if not device_id:
+            _LOGGER.warning(
+                "Cielo mobile REST fallback needs deviceId; command was not sent"
+            )
+            return
+
+        actions = msg.get("actions", {})
+        action_payload = {
+            "power": actions.get("power"),
+            "mode": actions.get("mode"),
+            "temp": str(actions["temp"])
+            if actions.get("temp") is not None
+            else None,
+            "actionType": action_type,
+        }
+        # iOS omits unavailable widget fields rather than sending JSON null.
+        action_payload = {
+            key: value for key, value in action_payload.items() if value is not None
+        }
+        payload = {
+            "macAddress": device.get("macAddress"),
+            "deviceName": device.get("deviceName"),
+            "mobileDeviceId": self._mobile_device_id,
+            "deviceId": str(device_id),
+            "userId": self._user_id,
+            "actionSource": "iOS",
+            "actions": action_payload,
+        }
+        headers = {
+            "accept": "*/*",
+            "authorization": self._access_token,
+            "content-type": "application/json",
+            "x-api-key": IOS_X_API_KEY,
+            "user-agent": IOS_USER_AGENT,
+        }
+
+        try:
+            async with ClientSession() as session:
+                async with session.post(
+                    "https://" + URL_API + "/device/perform-widget-action/1",
+                    headers=headers,
+                    json=payload,
+                ) as response:
+                    if response.status != 200:
+                        _LOGGER.warning(
+                            "Cielo mobile REST command failed with HTTP %s",
+                            response.status,
+                        )
+                        return
+                    result = await response.json()
+                    if result.get("status") not in (None, 200):
+                        _LOGGER.warning(
+                            "Cielo mobile REST command failed: %s",
+                            result.get("message", "unknown response"),
+                        )
+                        return
+                    self._apply_widget_action_result(device, result.get("data"))
+                    _LOGGER.debug("Cielo mobile REST command accepted")
+        except Exception as err:  # noqa: BLE001
+            _LOGGER.warning(
+                "Cielo mobile REST command failed: %s", _redact_url_secrets(err)
+            )
+
+    def _apply_widget_action_result(
+        self, device: dict, response_data: object
+    ) -> None:
+        """Apply Cielo's command acknowledgement before the next REST poll.
+
+        The widget endpoint returns the accepted ``latestAction`` immediately,
+        while ``/web/devices`` can lag behind it. Applying the acknowledgement
+        prevents an optimistic Home Assistant state from being overwritten by
+        a stale REST response just after a successful command.
+        """
+        if not isinstance(response_data, dict):
+            return
+
+        latest_action = response_data.get("latestAction")
+        if isinstance(latest_action, dict):
+            device.setdefault("latestAction", {}).update(latest_action)
+
+        if "deviceStatus" in response_data:
+            device["deviceStatus"] = response_data["deviceStatus"]
+
+        mac_address = device.get("macAddress")
+        for listener in self.__event_listener:
+            if listener.get_mac_address() == mac_address:
+                listener.state_device_receive(device)
 
     def start_timer_connection_lost(self):
         """None."""
@@ -545,7 +742,23 @@ class CieloHome:
         for listener in self.__event_listener:
             for device in devices:
                 if device["macAddress"] == listener.get_mac_address():
+                    if self._is_stale_rest_state(listener.get_device(), device):
+                        _LOGGER.debug(
+                            "Ignoring stale Cielo REST state for %s",
+                            device["macAddress"],
+                        )
+                        continue
                     listener.state_device_receive(device)
+
+    @staticmethod
+    def _is_stale_rest_state(current_device: dict, polled_device: dict) -> bool:
+        """Return whether a REST response predates the current device action."""
+        try:
+            current_timestamp = int(current_device["latestAction"]["timestamp"])
+            polled_timestamp = int(polled_device["latestAction"]["timestamp"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        return polled_timestamp < current_timestamp
 
     async def async_get_thermostats(self):
         """Get de the list Devices/Thermostats."""
@@ -674,5 +887,5 @@ class CieloHome:
 async def _log_exception(awaitable):
     try:
         return await awaitable
-    except Exception as e:
-        _LOGGER.exception(e)
+    except Exception as err:
+        _LOGGER.error("Cielo background task failed: %s", _redact_url_secrets(err))

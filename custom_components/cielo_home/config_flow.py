@@ -33,6 +33,14 @@ STEP_USER_DATA_SCHEMA = vol.Schema(
 )
 
 
+RECONFIGURE_DATA_SCHEMA = vol.Schema(
+    {
+        vol.Required("username"): str,
+        vol.Required("password"): str,
+    }
+)
+
+
 async def validate_input(hass: HomeAssistant, data: dict[str, Any]) -> dict[str, Any]:
     """Log in with email/password and return the config-entry data to store."""
 
@@ -101,6 +109,48 @@ class ConfigFlow(ConfigFlow, domain=DOMAIN):
 
         return self.async_show_form(
             step_id="user", data_schema=STEP_USER_DATA_SCHEMA, errors=errors
+        )
+
+    async def async_step_reconfigure(
+        self, user_input: dict[str, Any] | None = None
+    ) -> FlowResult:
+        """Refresh credentials and register the HA mobile client with Cielo."""
+
+        entry = self._get_reconfigure_entry()
+        if user_input is None:
+            return self.async_show_form(
+                step_id="reconfigure", data_schema=RECONFIGURE_DATA_SCHEMA
+            )
+
+        try:
+            info = await validate_input(
+                self.hass,
+                {
+                    **user_input,
+                    "force_connection_source": entry.data.get(
+                        "force_connection_source", False
+                    ),
+                    "connection_source": entry.data.get("connection_source", False),
+                },
+            )
+        except CannotConnect:
+            errors = {"base": "cannot_connect"}
+        except InvalidAuth:
+            errors = {"base": "invalid_auth"}
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.exception("Unexpected exception while reconfiguring Cielo Home")
+            errors = {"base": "unknown"}
+        else:
+            self.hass.config_entries.async_update_entry(
+                entry, data=info["data"], title=info["title"]
+            )
+            await self.hass.config_entries.async_reload(entry.entry_id)
+            return self.async_abort(reason="reconfigure_successful")
+
+        return self.async_show_form(
+            step_id="reconfigure",
+            data_schema=RECONFIGURE_DATA_SCHEMA,
+            errors=errors,
         )
 
 

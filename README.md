@@ -26,9 +26,10 @@ session tokens automatically, and refreshes them as needed.
 
 > **How it works / notes**
 > - The password is sent as a SHA-256 hash, exactly as the official apps do.
-> - The websocket `sessionId` is generated locally (the mobile login does not
->   return one). If live push updates ever stop working, that's the first thing
->   to revisit.
+> - The integration normally uses Cielo's legacy WebSocket for live updates.
+>   If Cielo rate-limits that service, it keeps the devices available through
+>   REST polling and uses Cielo's mobile widget endpoint for basic power, mode,
+>   and temperature controls.
 > - Two static app API keys are baked in (one for login, one for the `/web/*`
 >   API calls). If Cielo ever rotates them, they'd need updating in `const.py`.
 > - If the integration is offline long enough for the refresh token to expire,

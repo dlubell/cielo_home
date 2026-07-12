@@ -42,6 +42,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         entry.data["session_id"],
         entry.data["user_id"],
         entry.data["x_api_key"],
+        entry.data.get("mobile_device_id", ""),
     ):
         _LOGGER.error("Failed to login to Cielo Home")
 
